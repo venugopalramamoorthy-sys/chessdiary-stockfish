@@ -93,7 +93,8 @@ def analyze():
                         "quality": quality,
                         "comment": f"Engine evaluation: {eval_display:+.2f}",
                         "centipawnLoss": cp_loss,
-                        "evalAfter": current_eval,  # raw eval after this move
+                        "evalAfter": current_eval,
+                        "isWhiteMove": is_white_move,
                     })
 
                 prev_eval = current_eval
