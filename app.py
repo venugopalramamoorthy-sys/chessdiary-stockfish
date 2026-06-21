@@ -1,12 +1,3 @@
-# stockfish_server/app.py
-#
-# A tiny Flask server that runs the Stockfish chess engine.
-# Your Flutter app sends a PGN/move list here, and gets back
-# real engine-level analysis: centipawn evaluation, best move,
-# and move quality (best/good/inaccuracy/mistake/blunder).
-#
-# Deploy this FREE on Render.com (instructions in README).
-
 from flask import Flask, request, jsonify
 import chess
 import chess.engine
@@ -16,15 +7,11 @@ import os
 
 app = Flask(__name__)
 
-# Path to the Stockfish binary — set by the buildpack on Render
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "/usr/games/stockfish")
-
-# How deep the engine should think. Higher = more accurate but slower.
 ANALYSIS_DEPTH = 12
 
 
 def classify_move(cp_loss):
-    """Classify a move's quality based on centipawn loss compared to best move."""
     if cp_loss is None:
         return "good"
     if cp_loss <= 10:
@@ -47,23 +34,12 @@ def health():
 @app.route("/analyze", methods=["POST"])
 def analyze():
     """
-    Request body:
-    {
-        "pgn": "1. e4 e5 2. Nf3 Nc6 ..."
-    }
+    Request: { "pgn": "1. e4 e5 ..." }
 
     Response:
     {
-        "analysis": [
-            {
-                "moveNumber": 1,
-                "move": "e4",
-                "quality": "best",
-                "comment": "Engine eval: +0.3",
-                "centipawnLoss": 0
-            },
-            ...
-        ]
+        "analysis": [flagged moves with motif placeholder],
+        "evalCurve": [centipawn per half-move, white's perspective, capped ±2000]
     }
     """
     data = request.get_json()
@@ -79,10 +55,11 @@ def analyze():
 
         board = game.board()
         results = []
+        eval_curve = []  # full centipawn curve, one value per half-move
 
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
             move_number = 1
-            prev_eval = 0  # from white's perspective, in centipawns
+            prev_eval = 0
 
             for move in game.mainline_moves():
                 san = board.san(move)
@@ -90,7 +67,6 @@ def analyze():
 
                 board.push(move)
 
-                # Evaluate position AFTER the move
                 info = engine.analyse(board, chess.engine.Limit(depth=ANALYSIS_DEPTH))
                 score = info["score"].white()
 
@@ -99,8 +75,9 @@ def analyze():
                 else:
                     current_eval = score.score()
 
-                # Centipawn loss = how much the position got worse
-                # for the side that just moved
+                # Full eval curve (capped ±2000 for storage efficiency)
+                eval_curve.append(max(-2000, min(2000, current_eval)))
+
                 if is_white_move:
                     cp_loss = max(0, prev_eval - current_eval)
                 else:
@@ -108,8 +85,6 @@ def analyze():
 
                 quality = classify_move(cp_loss)
 
-                # Only include moves worth reporting (skip routine "best" moves
-                # in the opening to keep response concise)
                 if quality != "best" or move_number <= 10:
                     eval_display = current_eval / 100.0
                     results.append({
@@ -117,19 +92,23 @@ def analyze():
                         "move": san,
                         "quality": quality,
                         "comment": f"Engine evaluation: {eval_display:+.2f}",
-                        "centipawnLoss": cp_loss
+                        "centipawnLoss": cp_loss,
+                        "evalAfter": current_eval,  # raw eval after this move
                     })
 
                 prev_eval = current_eval
                 if not is_white_move:
                     move_number += 1
 
-        # Limit to the most significant 20 moves (favor mistakes/blunders)
+        # Top 20 most significant moves
         results.sort(key=lambda x: -x["centipawnLoss"])
         significant = results[:20]
         significant.sort(key=lambda x: x["moveNumber"])
 
-        return jsonify({"analysis": significant})
+        return jsonify({
+            "analysis": significant,
+            "evalCurve": eval_curve,
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
