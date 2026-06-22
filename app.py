@@ -1,14 +1,20 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import chess
 import chess.engine
 import chess.pgn
 import io
 import os
+import requests as req
 
 app = Flask(__name__)
+CORS(app)
 
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "/usr/games/stockfish")
 ANALYSIS_DEPTH = 12
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def classify_move(cp_loss):
@@ -113,6 +119,24 @@ def analyze():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/gemini", methods=["POST"])
+def gemini_proxy():
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY not set on server"}), 500
+
+    payload = request.get_json()
+    model = payload.get("model", "gemini-2.0-flash")
+    contents = payload.get("contents", [])
+
+    resp = req.post(
+        f"{GEMINI_BASE_URL}/{model}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={"contents": contents},
+        timeout=60,
+    )
+    return jsonify(resp.json()), resp.status_code
 
 
 if __name__ == "__main__":
