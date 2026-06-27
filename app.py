@@ -8,7 +8,12 @@ import os
 import requests as req
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "https://chessdiary.app",
+    "https://chessdiary-7f1e3.web.app",
+    "http://localhost:8080",
+    "http://localhost:5000",
+])
 
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "/usr/games/stockfish")
 ANALYSIS_DEPTH = 12
@@ -127,7 +132,7 @@ def gemini_proxy():
         return jsonify({"error": "GEMINI_API_KEY not set on server"}), 500
 
     payload = request.get_json()
-    model = payload.get("model", "gemini-2.0-flash")
+    model = payload.get("model", "gemini-2.5-flash")
     contents = payload.get("contents", [])
 
     resp = req.post(
