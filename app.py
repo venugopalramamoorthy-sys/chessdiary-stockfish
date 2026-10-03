@@ -7,6 +7,8 @@ import io
 import os
 import requests as req
 
+from auth import rate_limited, require_firebase_auth
+
 app = Flask(__name__)
 CORS(app, origins=[
     "https://chessdiary.app",
@@ -43,6 +45,8 @@ def health():
 
 
 @app.route("/analyze", methods=["POST"])
+@require_firebase_auth
+@rate_limited(20, "analyze")
 def analyze():
     """
     Request: { "pgn": "1. e4 e5 ..." }
@@ -127,6 +131,8 @@ def analyze():
 
 
 @app.route("/gemini", methods=["POST"])
+@require_firebase_auth
+@rate_limited(20, "gemini")
 def gemini_proxy():
     if not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set on server"}), 500
