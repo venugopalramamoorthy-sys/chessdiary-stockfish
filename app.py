@@ -44,6 +44,23 @@ def health():
     return jsonify({"status": "ok", "engine": "stockfish"})
 
 
+@app.route("/engine-info", methods=["GET"])
+def engine_info():
+    # Temporary diagnostic route -- reports what Stockfish binary/options
+    # this deployment is actually running, to root-cause an eval
+    # discrepancy vs. a local reference engine. Remove once resolved.
+    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+        board = chess.Board()
+        info = engine.analyse(board, chess.engine.Limit(depth=12))
+        return jsonify({
+            "id": engine.id,
+            "options": {k: str(v) for k, v in engine.options.items() if k in (
+                "Hash", "Threads", "UCI_LimitStrength", "UCI_Elo", "Skill Level", "Use NNUE"
+            )},
+            "startpos_depth12_score": str(info["score"]),
+        })
+
+
 @app.route("/analyze", methods=["POST"])
 @require_firebase_auth
 @rate_limited(20, "analyze")
