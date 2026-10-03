@@ -106,41 +106,6 @@ def health():
     return jsonify({"status": "ok", "engine": "stockfish"})
 
 
-@app.route("/debug-timing", methods=["GET"])
-@require_firebase_auth
-def debug_timing():
-    # Temporary diagnostic route -- measures real wall-clock search time on
-    # THIS production box at a given depth or time limit, for an explicit
-    # depth/cost tradeoff discussion. Does not touch /analyze. Remove once
-    # the numbers are reported.
-    import time
-    fen = request.args.get("fen", chess.STARTING_FEN)
-    try:
-        board = chess.Board(fen)
-    except ValueError as e:
-        return jsonify({"error": f"bad fen: {e}"}), 400
-    depth = request.args.get("depth")
-    time_limit = request.args.get("time")
-    if depth is None and time_limit is None:
-        return jsonify({"error": "pass depth or time"}), 400
-    limit_kwargs = {}
-    if depth is not None:
-        limit_kwargs["depth"] = int(depth)
-    if time_limit is not None:
-        limit_kwargs["time"] = float(time_limit)
-    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
-        t0 = time.monotonic()
-        info = engine.analyse(board, chess.engine.Limit(**limit_kwargs))
-        elapsed = time.monotonic() - t0
-        return jsonify({
-            "fen": fen,
-            "limit": limit_kwargs,
-            "elapsed_seconds": round(elapsed, 3),
-            "score": str(info["score"]),
-            "depth_reached": info.get("depth"),
-        })
-
-
 @app.route("/analyze", methods=["POST"])
 @require_firebase_auth
 @rate_limited(20, "analyze")
