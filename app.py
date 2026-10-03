@@ -39,54 +39,71 @@ def classify_move(cp_loss):
         return "blunder"
 
 
+# A forced mate is flattened to a single magic number (10000) by the old
+# is_mate()/mate() handling below, which throws away the actual mate
+# distance. Two
+# problems follow: (1) a mate-in-1 and a mate-in-10 both render as the
+# identical "+100.00", which doesn't reflect what the engine actually
+# found, and (2) subtracting that flat sentinel from a real centipawn
+# score (e.g. 10000 - 250) produces a nonsensical "centipawn loss" like
+# 9750 -- a sentinel isn't a real centipawn count, so arithmetic against
+# one is meaningless. mate_eval() keeps the distance (so two different
+# mate depths are two different numbers, display can say "Mate in N"),
+# and cp_loss_for_move() below special-cases every transition across a
+# mate boundary instead of ever subtracting through a sentinel.
+MATE_CP_CEILING = 10000
+
+
+def mate_eval(mate_in):
+    """White-POV pseudo-centipawn value for a mate score, monotonic in
+    distance (closer mate = larger magnitude) but always far outside any
+    real centipawn range, so it still caps to +-2000 in eval_curve like
+    the old flat sentinel did."""
+    magnitude = max(MATE_CP_CEILING - abs(mate_in) * 10, 9000)
+    return magnitude if mate_in > 0 else -magnitude
+
+
+def cp_loss_for_move(prev_eval, prev_mate, current_eval, current_mate, is_white_move):
+    """Centipawn loss for the side that just moved, aware of forced-mate
+    transitions on either side of the move:
+
+    - A move that keeps or delivers a forced mate for the mover is never
+      penalized (cp_loss 0) -- it's as good as a move can be, regardless
+      of whether a faster mate existed.
+    - A move made while already facing a forced mate, that still faces
+      one afterwards, isn't penalized further -- every legal move there
+      loses by force, so there's no meaningful "loss" to attribute to
+      this particular one.
+    - A move that escapes a forced mate against the mover is an
+      improvement, never a loss.
+    - A move that walks the mover INTO a now-forced mate against
+      themselves is graded on a fixed, sensible ceiling (still clearly a
+      blunder) instead of a raw sentinel-minus-real-centipawns figure.
+    - Anything not touching a mate score on either side is untouched:
+      the normal real-centipawn subtraction, exactly as before.
+    """
+    sign = 1 if is_white_move else -1
+    mover_mate_before = sign * prev_mate if prev_mate is not None else None
+    mover_mate_after = sign * current_mate if current_mate is not None else None
+
+    if mover_mate_after is not None and mover_mate_after > 0:
+        return 0  # keeps or delivers a forced mate for the mover
+    if mover_mate_before is not None and mover_mate_before < 0:
+        if mover_mate_after is not None and mover_mate_after < 0:
+            return 0  # already lost to forced mate, still is -- no fresh penalty
+        if mover_mate_after is None:
+            return 0  # escaped a forced mate against the mover
+    if mover_mate_after is not None and mover_mate_after < 0:
+        return 1000  # this move is what delivers the mover into a forced mate
+
+    mover_before = sign * prev_eval
+    mover_after = sign * current_eval
+    return max(0, mover_before - mover_after)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "engine": "stockfish"})
-
-
-@app.route("/engine-info", methods=["GET"])
-@require_firebase_auth
-def engine_info():
-    # Temporary diagnostic route -- reports what Stockfish binary/options
-    # this deployment is actually running, to root-cause an eval
-    # discrepancy vs. a local reference engine. Remove once resolved.
-    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
-        board = chess.Board()
-        info = engine.analyse(board, chess.engine.Limit(depth=12))
-        return jsonify({
-            "id": engine.id,
-            "options": {k: str(v) for k, v in engine.options.items() if k in (
-                "Hash", "Threads", "UCI_LimitStrength", "UCI_Elo", "Skill Level", "Use NNUE"
-            )},
-            "startpos_depth12_score": str(info["score"]),
-        })
-
-
-@app.route("/debug-analyze", methods=["GET"])
-@require_firebase_auth
-def debug_analyze():
-    # Temporary diagnostic route -- analyse an arbitrary FEN at an
-    # arbitrary depth/hash on THIS exact production engine binary, to
-    # settle whether a forced mate genuinely exists at a given position
-    # or whether it's a search-depth/hash artifact. Remove once resolved.
-    fen = request.args.get("fen", chess.STARTING_FEN)
-    depth = int(request.args.get("depth", 12))
-    hash_mb = int(request.args.get("hash", 16))
-    try:
-        board = chess.Board(fen)
-    except ValueError as e:
-        return jsonify({"error": f"bad fen: {e}"}), 400
-    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
-        engine.configure({"Hash": hash_mb})
-        info = engine.analyse(board, chess.engine.Limit(depth=depth))
-        pv = info.get("pv", [])
-        return jsonify({
-            "fen": fen,
-            "depth": depth,
-            "hash": hash_mb,
-            "score": str(info["score"]),
-            "pv_san": board.variation_san(pv) if pv else None,
-        })
 
 
 @app.route("/analyze", methods=["POST"])
@@ -125,6 +142,7 @@ def analyze():
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
             move_number = 1
             prev_eval = 0
+            prev_mate = None  # white-POV signed mate distance, or None if not mate
 
             for move in game.mainline_moves():
                 san = board.san(move)
@@ -144,18 +162,20 @@ def analyze():
                     # player's favor depending on who just moved -- it can
                     # never be an inaccuracy/mistake/blunder, so it's handled
                     # here directly instead of going through classify_move().
-                    current_eval = 10000 if is_white_move else -10000
+                    current_mate = 1 if is_white_move else -1
+                    current_eval = mate_eval(current_mate)
                     eval_curve.append(max(-2000, min(2000, current_eval)))
                     mate_entry = {
                         "moveNumber": move_number,
                         "move": san,
                         "quality": "checkmate",
-                        "comment": f"Checkmate — engine evaluation: {current_eval / 100.0:+.2f}",
+                        "comment": f"Checkmate — {'White' if is_white_move else 'Black'} wins",
                         "centipawnLoss": 0,
                         "evalAfter": current_eval,
                         "isWhiteMove": is_white_move,
                     }
                     prev_eval = current_eval
+                    prev_mate = current_mate
                     if not is_white_move:
                         move_number += 1
                     continue
@@ -164,33 +184,35 @@ def analyze():
                 score = info["score"].white()
 
                 if score.is_mate():
-                    current_eval = 10000 if score.mate() > 0 else -10000
+                    current_mate = score.mate()
+                    current_eval = mate_eval(current_mate)
                 else:
+                    current_mate = None
                     current_eval = score.score()
 
                 # Full eval curve (capped ±2000 for storage efficiency)
                 eval_curve.append(max(-2000, min(2000, current_eval)))
 
-                if is_white_move:
-                    cp_loss = max(0, prev_eval - current_eval)
-                else:
-                    cp_loss = max(0, current_eval - prev_eval)
-
+                cp_loss = cp_loss_for_move(prev_eval, prev_mate, current_eval, current_mate, is_white_move)
                 quality = classify_move(cp_loss)
 
                 if quality != "best" or move_number <= 10:
-                    eval_display = current_eval / 100.0
+                    if current_mate is not None:
+                        eval_display = f"Mate in {abs(current_mate)} for {'White' if current_mate > 0 else 'Black'}"
+                    else:
+                        eval_display = f"Engine evaluation: {current_eval / 100.0:+.2f}"
                     results.append({
                         "moveNumber": move_number,
                         "move": san,
                         "quality": quality,
-                        "comment": f"Engine evaluation: {eval_display:+.2f}",
+                        "comment": eval_display,
                         "centipawnLoss": cp_loss,
                         "evalAfter": current_eval,
                         "isWhiteMove": is_white_move,
                     })
 
                 prev_eval = current_eval
+                prev_mate = current_mate
                 if not is_white_move:
                     move_number += 1
 
