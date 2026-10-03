@@ -72,6 +72,11 @@ def analyze():
         results = []
         eval_curve = []  # full centipawn curve, one value per half-move
 
+        mate_entry = None  # the move that actually delivers checkmate, if any -- kept
+        # separate from `results` so it can never be dropped by the top-20-by-
+        # significance cut below (see its centipawnLoss of 0, which would
+        # otherwise sort it to the bottom in a game with several real blunders).
+
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
             move_number = 1
             prev_eval = 0
@@ -81,6 +86,34 @@ def analyze():
                 is_white_move = board.turn == chess.WHITE
 
                 board.push(move)
+
+                if board.is_checkmate():
+                    # The move just played ends the game -- the side to move
+                    # now has zero legal moves, so there is nothing left for
+                    # the engine to search. Calling engine.analyse() on a
+                    # position like this previously produced a nonsensical
+                    # score (e.g. -100.00 "blunder" on the actual mating
+                    # move) because a terminal position has no well-defined
+                    # search result. A move that delivers checkmate is by
+                    # definition the best move on the board, in either
+                    # player's favor depending on who just moved -- it can
+                    # never be an inaccuracy/mistake/blunder, so it's handled
+                    # here directly instead of going through classify_move().
+                    current_eval = 10000 if is_white_move else -10000
+                    eval_curve.append(max(-2000, min(2000, current_eval)))
+                    mate_entry = {
+                        "moveNumber": move_number,
+                        "move": san,
+                        "quality": "checkmate",
+                        "comment": f"Checkmate — engine evaluation: {current_eval / 100.0:+.2f}",
+                        "centipawnLoss": 0,
+                        "evalAfter": current_eval,
+                        "isWhiteMove": is_white_move,
+                    }
+                    prev_eval = current_eval
+                    if not is_white_move:
+                        move_number += 1
+                    continue
 
                 info = engine.analyse(board, chess.engine.Limit(depth=ANALYSIS_DEPTH))
                 score = info["score"].white()
@@ -116,9 +149,14 @@ def analyze():
                 if not is_white_move:
                     move_number += 1
 
-        # Top 20 most significant moves
+        # Top 20 most significant moves, plus the checkmating move (if any)
+        # unconditionally -- it's the single most important move of the
+        # game regardless of where its centipawnLoss of 0 would otherwise
+        # place it in a significance-ordered cut.
         results.sort(key=lambda x: -x["centipawnLoss"])
         significant = results[:20]
+        if mate_entry is not None:
+            significant.append(mate_entry)
         significant.sort(key=lambda x: x["moveNumber"])
 
         return jsonify({
