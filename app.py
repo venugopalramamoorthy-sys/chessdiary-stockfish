@@ -45,6 +45,7 @@ def health():
 
 
 @app.route("/engine-info", methods=["GET"])
+@require_firebase_auth
 def engine_info():
     # Temporary diagnostic route -- reports what Stockfish binary/options
     # this deployment is actually running, to root-cause an eval
@@ -58,6 +59,33 @@ def engine_info():
                 "Hash", "Threads", "UCI_LimitStrength", "UCI_Elo", "Skill Level", "Use NNUE"
             )},
             "startpos_depth12_score": str(info["score"]),
+        })
+
+
+@app.route("/debug-analyze", methods=["GET"])
+@require_firebase_auth
+def debug_analyze():
+    # Temporary diagnostic route -- analyse an arbitrary FEN at an
+    # arbitrary depth/hash on THIS exact production engine binary, to
+    # settle whether a forced mate genuinely exists at a given position
+    # or whether it's a search-depth/hash artifact. Remove once resolved.
+    fen = request.args.get("fen", chess.STARTING_FEN)
+    depth = int(request.args.get("depth", 12))
+    hash_mb = int(request.args.get("hash", 16))
+    try:
+        board = chess.Board(fen)
+    except ValueError as e:
+        return jsonify({"error": f"bad fen: {e}"}), 400
+    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+        engine.configure({"Hash": hash_mb})
+        info = engine.analyse(board, chess.engine.Limit(depth=depth))
+        pv = info.get("pv", [])
+        return jsonify({
+            "fen": fen,
+            "depth": depth,
+            "hash": hash_mb,
+            "score": str(info["score"]),
+            "pv_san": board.variation_san(pv) if pv else None,
         })
 
 
