@@ -4,17 +4,23 @@ import chess
 import chess.engine
 import chess.pgn
 import io
+import logging
 import os
 import requests as req
 
 from auth import rate_limited, require_firebase_auth
 
 app = Flask(__name__)
+# Scoresheet photos/PDFs arrive base64-encoded inside the /gemini JSON body,
+# which Gemini itself caps at 20 MB per request
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+# Local dev origins (e.g. "http://localhost:8080") come from the environment
+# so production doesn't accept them
 CORS(app, origins=[
     "https://chessdiary.app",
     "https://chessdiary-7f1e3.web.app",
-    "http://localhost:8080",
-    "http://localhost:5000",
+    *filter(None, os.environ.get("CORS_DEV_ORIGINS", "").split(",")),
 ])
 
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "/usr/games/stockfish")
@@ -22,6 +28,20 @@ ANALYSIS_DEPTH = 12
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+# The client used to choose the model, and the name went straight into the
+# upstream URL -- letting any signed-in user pick pricier models or reach
+# other Gemini API endpoints with our key. Only models the app uses pass.
+GEMINI_ALLOWED_MODELS = {"gemini-2.5-flash"}
+GEMINI_ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/heic", "image/heif",
+    "application/pdf", "text/plain",
+}
+MAX_PROMPT_CHARS = 30_000
+
+# A real game is well under this; it bounds how long one request can keep
+# Stockfish busy
+MAX_PGN_CHARS = 20_000
+MAX_PLIES = 400
 
 
 def classify_move(cp_loss):
@@ -108,7 +128,7 @@ def health():
 
 @app.route("/analyze", methods=["POST"])
 @require_firebase_auth
-@rate_limited(20, "analyze")
+@rate_limited(10, "analyze", max_per_day=150)
 def analyze():
     """
     Request: { "pgn": "1. e4 e5 ..." }
@@ -119,16 +139,20 @@ def analyze():
         "evalCurve": [centipawn per half-move, white's perspective, capped ±2000]
     }
     """
-    data = request.get_json()
-    pgn_text = data.get("pgn", "")
+    data = request.get_json(silent=True)
+    pgn_text = data.get("pgn", "") if isinstance(data, dict) else ""
 
-    if not pgn_text.strip():
+    if not isinstance(pgn_text, str) or not pgn_text.strip():
         return jsonify({"error": "No PGN provided"}), 400
+    if len(pgn_text) > MAX_PGN_CHARS:
+        return jsonify({"error": "PGN too long"}), 413
 
     try:
         game = chess.pgn.read_game(io.StringIO(pgn_text))
         if game is None:
             return jsonify({"error": "Could not parse PGN"}), 400
+        if sum(1 for _ in game.mainline_moves()) > MAX_PLIES:
+            return jsonify({"error": f"Game too long (max {MAX_PLIES // 2} moves)"}), 413
 
         board = game.board()
         results = []
@@ -231,28 +255,79 @@ def analyze():
             "evalCurve": eval_curve,
         })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logging.exception("Analysis failed")
+        return jsonify({"error": "Analysis failed"}), 500
+
+
+def _valid_gemini_contents(contents) -> bool:
+    """Accept only the shape the app sends: one user turn holding a text
+    prompt and at most one inline image/PDF."""
+    if not isinstance(contents, list) or len(contents) != 1:
+        return False
+    turn = contents[0]
+    if not isinstance(turn, dict) or set(turn) - {"parts", "role"}:
+        return False
+    parts = turn.get("parts")
+    if not isinstance(parts, list) or not 1 <= len(parts) <= 2:
+        return False
+    texts = inline = 0
+    for part in parts:
+        if not isinstance(part, dict) or len(part) != 1:
+            return False
+        if "text" in part:
+            if not isinstance(part["text"], str) or len(part["text"]) > MAX_PROMPT_CHARS:
+                return False
+            texts += 1
+        elif "inlineData" in part:
+            data = part["inlineData"]
+            if (not isinstance(data, dict) or set(data) != {"mimeType", "data"}
+                    or data["mimeType"] not in GEMINI_ALLOWED_MIME_TYPES
+                    or not isinstance(data["data"], str)):
+                return False
+            inline += 1
+        else:
+            return False
+    return texts == 1 and inline <= 1
 
 
 @app.route("/gemini", methods=["POST"])
 @require_firebase_auth
-@rate_limited(20, "gemini")
+@rate_limited(10, "gemini", max_per_day=150)
 def gemini_proxy():
     if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY not set on server"}), 500
+        logging.error("GEMINI_API_KEY not set")
+        return jsonify({"error": "AI service unavailable"}), 503
 
-    payload = request.get_json()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid request"}), 400
     model = payload.get("model", "gemini-2.5-flash")
-    contents = payload.get("contents", [])
+    if model not in GEMINI_ALLOWED_MODELS:
+        return jsonify({"error": "Model not allowed"}), 400
+    contents = payload.get("contents")
+    if not _valid_gemini_contents(contents):
+        return jsonify({"error": "Invalid request"}), 400
 
-    resp = req.post(
-        f"{GEMINI_BASE_URL}/{model}:generateContent",
-        params={"key": GEMINI_API_KEY},
-        json={"contents": contents},
-        timeout=60,
-    )
-    return jsonify(resp.json()), resp.status_code
+    try:
+        resp = req.post(
+            f"{GEMINI_BASE_URL}/{model}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            json={"contents": contents},
+            timeout=60,
+        )
+        body = resp.json()
+    except Exception:
+        logging.exception("Gemini request failed")
+        return jsonify({"error": "AI service error"}), 502
+
+    if resp.status_code != 200:
+        # Pass on only Google's status code name (e.g. RESOURCE_EXHAUSTED,
+        # which the app shows as "at capacity"), not the full error body
+        status = (body.get("error") or {}).get("status", "UNKNOWN") if isinstance(body, dict) else "UNKNOWN"
+        logging.warning("Gemini returned %s: %s", resp.status_code, status)
+        return jsonify({"error": status}), resp.status_code
+    return jsonify(body), 200
 
 
 if __name__ == "__main__":
