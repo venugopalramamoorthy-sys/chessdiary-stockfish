@@ -3,4 +3,4 @@ flask-cors==6.0.0
 chess==1.10.0
 gunicorn==27.0.1
 requests==2.33.0
-pyjwt[crypto]==2.14.0
+pyjwt[crypto]==2.15.1
